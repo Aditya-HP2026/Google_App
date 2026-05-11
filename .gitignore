@@ -17,4 +17,5 @@ local.properties
 # Project exclude paths
 /documentai/build/
 /gemmaimage/build/
-/semanticsearch/build/
+/semanticsearch/build/documentai/src/main/assets/document_ai/paddleocr_distil_old_bundle/distilbert/model.onnx
+*.onnx
