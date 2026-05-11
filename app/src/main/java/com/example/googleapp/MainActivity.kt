@@ -11,7 +11,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -50,14 +49,24 @@ import com.example.gemmaimage.GemmaInitException
 import com.example.semanticsearch.SemanticSearchEngine
 import com.example.semanticsearch.model.SearchResult
 import com.example.googleapp.ui.theme.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
+import java.util.concurrent.Executors
+
+private const val PERF_TAG = "PerfLog"
+private const val MAX_GEMMA_BATCH_SIZE = 5
 
 // ─── Data class for a classified item ────────────────────────────────────────
 
 data class ClassifiedImage(
+    val id: Long,                // Unique ID for stable keys
     val thumbnail: Bitmap,       // Small thumbnail for UI (max 400px)
     val label: String,
     val confidence: Float,
@@ -90,6 +99,15 @@ val ALL_SUBJECT_META = listOf(
     SubjectMeta("social_studies",  "Social Studies",  SocialStudiesColor, SocialStudiesCircle, Icons.Default.Groups),
     SubjectMeta("accounting",      "Accounting",      AccountingColor,    AccountingCircle,    Icons.Default.Calculate),
     SubjectMeta("business_studies","Business",        BusinessColor,      BusinessCircle,      Icons.Default.TrendingUp)
+)
+
+// ─── ID generator ─────────────────────────────────────────────────────────────
+private var nextClassifiedId = 0L
+private fun nextId(): Long = ++nextClassifiedId
+
+private data class GemmaPipelineLoadResult(
+    val pipeline: GemmaImagePipeline?,
+    val message: String?
 )
 
 // ─── Activity ─────────────────────────────────────────────────────────────────
@@ -209,16 +227,27 @@ fun MainScreen() {
     var searchEngine by remember { mutableStateOf<SemanticSearchEngine?>(null) }
     var searchEngineError by remember { mutableStateOf("") }
 
+    // Shared classified images state (accessible by both tabs)
+    var classifiedImages by remember { mutableStateOf(listOf<ClassifiedImage>()) }
+
+    // Log recomposition of MainScreen
+    SideEffect {
+        Log.d(PERF_TAG, "MainScreen recomposed, tab=$selectedTab, images=${classifiedImages.size}")
+    }
+
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
+        val initResult = withContext(Dispatchers.IO) {
             val dbFile = File(context.getExternalFilesDir(null), "knowledge.db")
-            try {
-                searchEngine = SemanticSearchEngine(context, dbFile)
-                searchEngineError = ""
-            } catch (e: Exception) {
-                searchEngineError = e.message ?: "Failed to initialize search engine"
-            }
+            runCatching { SemanticSearchEngine(context, dbFile) }
         }
+        initResult
+            .onSuccess {
+                searchEngine = it
+                searchEngineError = ""
+            }
+            .onFailure {
+                searchEngineError = it.message ?: "Failed to initialize search engine"
+            }
     }
 
     Scaffold(
@@ -241,8 +270,16 @@ fun MainScreen() {
     ) { innerPadding ->
         Box(modifier = Modifier.padding(innerPadding)) {
             when (selectedTab) {
-                0 -> ClassifyTab(searchEngine = searchEngine)
-                1 -> SearchTab(searchEngine = searchEngine, engineError = searchEngineError)
+                0 -> ClassifyTab(
+                    searchEngine = searchEngine,
+                    classifiedImages = classifiedImages,
+                    onImagesUpdated = { classifiedImages = it }
+                )
+                1 -> SearchTab(
+                    searchEngine = searchEngine,
+                    engineError = searchEngineError,
+                    classifiedImages = classifiedImages
+                )
             }
         }
     }
@@ -252,194 +289,186 @@ fun MainScreen() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
+fun ClassifyTab(
+    searchEngine: SemanticSearchEngine?,
+    classifiedImages: List<ClassifiedImage>,
+    onImagesUpdated: (List<ClassifiedImage>) -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var classifiedImages by remember { mutableStateOf(listOf<ClassifiedImage>()) }
     var isProcessing by remember { mutableStateOf(false) }
     var processingProgress by remember { mutableStateOf("") }
+    var processedCount by remember { mutableIntStateOf(0) }
+    var totalToProcess by remember { mutableIntStateOf(0) }
     var selectedPipeline by remember { mutableIntStateOf(0) }
     var distilPipeline by remember { mutableStateOf<DocumentAiPipeline?>(null) }
     var gemmaPipeline by remember { mutableStateOf<GemmaImagePipeline?>(null) }
+    var processingJob by remember { mutableStateOf<Job?>(null) }
 
     // Detail dialog state
     var selectedSubject by remember { mutableStateOf<SubjectMeta?>(null) }
+
+    val gemmaDispatcher = remember {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "GemmaInference").apply {
+                priority = Thread.MIN_PRIORITY
+            }
+        }.asCoroutineDispatcher()
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            processingJob?.cancel()
+            gemmaDispatcher.close()
+        }
+    }
 
     // File picker that supports images AND documents
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris: List<Uri> ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
+
+        val pipelineChoice = selectedPipeline
+        val queuedUris = if (pipelineChoice == 1 && uris.size > MAX_GEMMA_BATCH_SIZE) {
+            Toast.makeText(
+                context,
+                "Gemma will process the first $MAX_GEMMA_BATCH_SIZE files to keep the app responsive.",
+                Toast.LENGTH_LONG
+            ).show()
+            uris.take(MAX_GEMMA_BATCH_SIZE)
+        } else {
+            uris
+        }
+
+        processingJob?.cancel()
         isProcessing = true
         processingProgress = "Preparing…"
+        processedCount = 0
+        totalToProcess = queuedUris.size
 
-        scope.launch {
+        val existingImages = classifiedImages
+        processingJob = scope.launch {
+            val batchStartMs = System.currentTimeMillis()
             val results = mutableListOf<ClassifiedImage>()
+            Log.d(PERF_TAG, "── Processing batch start: ${queuedUris.size} file(s) ──")
 
-            withContext(Dispatchers.IO) {
-                for (uri in uris) {
-                    val fileName = getFileName(context, uri)
+            try {
+                var localDistil = distilPipeline
+                var localGemma = gemmaPipeline
 
-                    if (isPdf(context, uri)) {
-                        // ── PDF: classify as single document ──────────────
-                        val totalPages = getPdfPageCount(context, uri)
-                        val pages = renderPdfPages(context, uri, MAX_PDF_PAGES)
-                        if (pages.isEmpty()) continue
-
-                        processingProgress = "Classifying $fileName (${pages.size} pages)…"
-
-                        // Use first page as thumbnail
-                        val thumb = createThumbnail(pages.first())
-
-                        if (selectedPipeline == 0) {
-                            // PaddleOCR+DistilBERT: classify first page only for the label
-                            if (distilPipeline == null) {
-                                processingProgress = "Loading OCR + Classifier…"
-                                distilPipeline = DocumentAiPipeline(context)
-                            }
-                            try {
-                                val res = distilPipeline!!.runPipeline(pages.first())
-                                results += ClassifiedImage(
-                                    thumbnail = thumb,
-                                    label = res.classification.label,
-                                    confidence = res.classification.confidence,
-                                    keywords = emptyList(),
-                                    ocrText = res.ocr.text,
-                                    pipeline = "PaddleOCR+DistilBERT",
-                                    sourceName = fileName,
-                                    pageCount = totalPages
-                                )
-                            } catch (_: Exception) {}
-                        } else {
-                            // Gemma: classify first page
-                            val pipe = ensureGemmaPipeline(context, gemmaPipeline) { p, msg ->
-                                gemmaPipeline = p
-                                if (msg != null) {
-                                    withContext(Dispatchers.Main) { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
-                                }
-                            }
-                            if (pipe == null) { isProcessing = false; return@withContext }
-                            gemmaPipeline = pipe
-
-                            val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
-                            processingProgress = "Classifying $fileName on $backendLabel…"
-                            try {
-                                val res = pipe.classify(pages.first())
-                                results += ClassifiedImage(
-                                    thumbnail = thumb,
-                                    label = res.label,
-                                    confidence = res.confidence,
-                                    keywords = res.keywords,
-                                    ocrText = res.evidence,
-                                    pipeline = "Gemma 4 E2B ($backendLabel)",
-                                    sourceName = fileName,
-                                    pageCount = totalPages
-                                )
-                            } catch (e: Exception) {
-                                Log.e("GemmaPipeline", "Classification failed for $fileName", e)
-                            }
-                        }
-                        // Recycle page bitmaps to free memory
-                        pages.forEach { if (it != thumb) it.recycle() }
-
-                    } else {
-                        // ── Single image ─────────────────────────────────
-                        val bitmap = loadBitmapFromUri(context, uri) ?: continue
-                        val thumb = createThumbnail(bitmap)
-
-                        processingProgress = "Classifying $fileName…"
-
-                        if (selectedPipeline == 0) {
-                            if (distilPipeline == null) {
-                                processingProgress = "Loading OCR + Classifier…"
-                                distilPipeline = DocumentAiPipeline(context)
-                            }
-                            try {
-                                val res = distilPipeline!!.runPipeline(bitmap)
-                                results += ClassifiedImage(
-                                    thumbnail = thumb,
-                                    label = res.classification.label,
-                                    confidence = res.classification.confidence,
-                                    keywords = emptyList(),
-                                    ocrText = res.ocr.text,
-                                    pipeline = "PaddleOCR+DistilBERT",
-                                    sourceName = fileName
-                                )
-                            } catch (_: Exception) {}
-                        } else {
-                            val pipe = ensureGemmaPipeline(context, gemmaPipeline) { p, msg ->
-                                gemmaPipeline = p
-                                if (msg != null) {
-                                    withContext(Dispatchers.Main) { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
-                                }
-                            }
-                            if (pipe == null) { isProcessing = false; return@withContext }
-                            gemmaPipeline = pipe
-
-                            val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
-                            processingProgress = "Classifying $fileName on $backendLabel…"
-                            try {
-                                val res = pipe.classify(bitmap)
-                                results += ClassifiedImage(
-                                    thumbnail = thumb,
-                                    label = res.label,
-                                    confidence = res.confidence,
-                                    keywords = res.keywords,
-                                    ocrText = res.evidence,
-                                    pipeline = "Gemma 4 E2B ($backendLabel)",
-                                    sourceName = fileName
-                                )
-                            } catch (e: Exception) {
-                                Log.e("GemmaPipeline", "Classification failed for $fileName", e)
-                            }
-                        }
-                        // Recycle original if we made a separate thumbnail
-                        if (bitmap != thumb) bitmap.recycle()
-                    }
+                if (localDistil == null) {
+                    processingProgress = if (pipelineChoice == 0) "Loading OCR + Classifier…" else "Loading OCR…"
+                    localDistil = withContext(Dispatchers.Default) { DocumentAiPipeline(context) }
+                    distilPipeline = localDistil
                 }
-            }
 
-            classifiedImages = classifiedImages + results
+                if (pipelineChoice == 1) {
+                    processingProgress = "Loading Gemma…"
+                    val loadResult = withContext(gemmaDispatcher) {
+                        loadGemmaPipeline(context, localGemma)
+                    }
+                    localGemma = loadResult.pipeline
+                    if (loadResult.message != null) {
+                        Toast.makeText(context, loadResult.message, Toast.LENGTH_LONG).show()
+                    }
+                    if (localGemma == null) {
+                        isProcessing = false
+                        processingProgress = ""
+                        totalToProcess = 0
+                        processingJob = null
+                        return@launch
+                    }
+                    gemmaPipeline = localGemma
+                }
 
-            // Index for semantic search
-            if (searchEngine != null && results.isNotEmpty()) {
-                withContext(Dispatchers.IO) {
-                    for ((index, img) in results.withIndex()) {
-                        try {
-                            searchEngine.indexDocument(
-                                sourcePath = img.sourceName,
-                                subject = img.label,
-                                keywords = img.keywords.ifEmpty { img.ocrText.split(" ").take(10) },
-                                textChunk = img.ocrText.ifEmpty { img.keywords.joinToString(" ") }
-                            )
-                        } catch (e: Exception) {
-                            Log.e("SearchIndex", "Failed to index", e)
+                for ((idx, uri) in queuedUris.withIndex()) {
+                    yield()
+                    val fileName = withContext(Dispatchers.IO) { getFileName(context, uri) }
+                    processingProgress = "Classifying ${idx + 1}/${queuedUris.size}: $fileName"
+
+                    val dispatcher = if (pipelineChoice == 1) gemmaDispatcher else Dispatchers.Default
+                    val item = withContext(dispatcher) {
+                        classifyUri(
+                            context = context,
+                            uri = uri,
+                            fileName = fileName,
+                            selectedPipeline = pipelineChoice,
+                            distilPipeline = localDistil,
+                            gemmaPipeline = localGemma
+                        )
+                    }
+
+                    if (item != null) {
+                        results += item
+                        onImagesUpdated(existingImages + results.toList())
+                    }
+                    processedCount = idx + 1
+                    delay(80)
+                }
+
+                Log.d(PERF_TAG, "── Batch complete: ${System.currentTimeMillis() - batchStartMs}ms total, ${results.size} results ──")
+
+                isProcessing = false
+                processingProgress = ""
+                processingJob = null
+
+                if (results.isEmpty()) {
+                    Toast.makeText(context, "No content detected", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Classified ${results.size} item(s)", Toast.LENGTH_SHORT).show()
+                }
+
+                if (searchEngine != null && results.isNotEmpty()) {
+                    scope.launch(Dispatchers.IO) {
+                        results.forEach { img ->
+                            try {
+                                searchEngine.indexDocument(
+                                    sourcePath = img.sourceName,
+                                    subject = img.label,
+                                    keywords = img.keywords.ifEmpty { img.ocrText.split(" ").filter { it.isNotBlank() }.take(10) },
+                                    textChunk = img.ocrText.ifEmpty { img.keywords.joinToString(" ") }
+                                )
+                            } catch (e: Exception) {
+                                Log.e("SearchIndex", "Failed to index ${img.sourceName}", e)
+                            }
                         }
                     }
                 }
-            }
-
-            isProcessing = false
-            processingProgress = ""
-            if (results.isEmpty()) {
-                Toast.makeText(context, "No content detected", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(context, "Classified ${results.size} item(s)", Toast.LENGTH_SHORT).show()
+            } catch (_: CancellationException) {
+                isProcessing = false
+                processingProgress = ""
+                processedCount = 0
+                totalToProcess = 0
+                processingJob = null
+                Toast.makeText(context, "Processing cancelled", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Log.e(PERF_TAG, "Batch processing failed", e)
+                isProcessing = false
+                processingProgress = ""
+                processedCount = 0
+                totalToProcess = 0
+                processingJob = null
+                Toast.makeText(context, "Processing failed: ${e.message?.take(80)}", Toast.LENGTH_LONG).show()
             }
         }
     }
 
     // ── UI ────────────────────────────────────────────────────────────────────
-    LazyColumn(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(AppBackground)
-            .padding(horizontal = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
     ) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
         // Header
-        item {
+        item(key = "header") {
             Spacer(Modifier.height(48.dp))
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Text("✨", fontSize = 22.sp)
@@ -456,7 +485,7 @@ fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
         }
 
         // Pipeline toggle
-        item {
+        item(key = "pipeline") {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
@@ -483,7 +512,7 @@ fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
         }
 
         // Upload card
-        item {
+        item(key = "upload") {
             UploadCard(
                 onChooseFiles = {
                     filePickerLauncher.launch(arrayOf("image/*", "application/pdf"))
@@ -494,14 +523,20 @@ fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
             Spacer(Modifier.height(20.dp))
         }
 
-        // Subject grid (2 columns)
+        // Subject grid (2 columns) - use stable keys
         val rows = ALL_SUBJECT_META.chunked(2)
-        items(rows) { row ->
+        items(rows, key = { row -> row.map { it.label }.joinToString() }) { row ->
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 for (meta in row) {
+                    val count = remember(classifiedImages) {
+                        classifiedImages.count { it.label == meta.label }
+                    }
                     SubjectCard(
                         meta = meta,
-                        images = classifiedImages.filter { it.label == meta.label },
+                        count = count,
+                        firstImage = remember(classifiedImages) {
+                            classifiedImages.firstOrNull { it.label == meta.label }
+                        },
                         modifier = Modifier.weight(1f),
                         onClick = { selectedSubject = meta }
                     )
@@ -511,12 +546,24 @@ fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
             Spacer(Modifier.height(12.dp))
         }
 
-        item { Spacer(Modifier.height(24.dp)) }
+            item(key = "bottom_spacer") { Spacer(Modifier.height(24.dp)) }
+        }
+
+        if (isProcessing) {
+            ProcessingOverlay(
+                progressText = processingProgress,
+                completed = processedCount,
+                total = totalToProcess,
+                onCancel = { processingJob?.cancel() }
+            )
+        }
     }
 
     // ── Detail dialog when subject tile is tapped ─────────────────────────────
     selectedSubject?.let { meta ->
-        val subjectImages = classifiedImages.filter { it.label == meta.label }
+        val subjectImages = remember(classifiedImages, meta) {
+            classifiedImages.filter { it.label == meta.label }
+        }
         SubjectDetailDialog(
             meta = meta,
             images = subjectImages,
@@ -525,18 +572,15 @@ fun ClassifyTab(searchEngine: SemanticSearchEngine?) {
     }
 }
 
-/** Ensure Gemma pipeline is loaded, with proper error handling */
-private suspend fun ensureGemmaPipeline(
+private fun loadGemmaPipeline(
     context: android.content.Context,
-    existing: GemmaImagePipeline?,
-    onResult: suspend (GemmaImagePipeline?, String?) -> Unit
-): GemmaImagePipeline? {
-    if (existing != null) return existing
+    existing: GemmaImagePipeline?
+): GemmaPipelineLoadResult {
+    if (existing != null) return GemmaPipelineLoadResult(existing, null)
 
     val modelFile = File(context.getExternalFilesDir(null), GemmaImagePipeline.MODEL_FILE_NAME)
     if (!modelFile.exists()) {
-        onResult(null, "Place ${GemmaImagePipeline.MODEL_FILE_NAME} in app files")
-        return null
+        return GemmaPipelineLoadResult(null, "Place ${GemmaImagePipeline.MODEL_FILE_NAME} in app files")
     }
 
     return try {
@@ -545,14 +589,128 @@ private suspend fun ensureGemmaPipeline(
         val initMs = pipe.initResult?.initTimeMs ?: 0
         val didFallback = pipe.initResult?.didFallback == true
         val msg = if (didFallback) "⚠ GPU unavailable — using CPU (${initMs}ms)"
-                  else "✅ Running on $backend (${initMs}ms)"
-        onResult(pipe, msg)
-        pipe
+        else "✅ Running on $backend (${initMs}ms)"
+        GemmaPipelineLoadResult(pipe, msg)
     } catch (e: Exception) {
         Log.e("GemmaPipeline", "Failed to load Gemma model", e)
         val friendlyMsg = if (e is GemmaInitException) "All backends failed" else "Load error: ${e.message?.take(80)}"
-        onResult(null, friendlyMsg)
-        null
+        GemmaPipelineLoadResult(null, friendlyMsg)
+    }
+}
+
+private fun classifyUri(
+    context: android.content.Context,
+    uri: Uri,
+    fileName: String,
+    selectedPipeline: Int,
+    distilPipeline: DocumentAiPipeline?,
+    gemmaPipeline: GemmaImagePipeline?
+): ClassifiedImage? {
+    val fileStartMs = System.currentTimeMillis()
+    Log.d(PERF_TAG, "Start file: $fileName")
+
+    if (isPdf(context, uri)) {
+        val totalPages = getPdfPageCount(context, uri)
+        val renderStartMs = System.currentTimeMillis()
+        val pages = renderPdfPages(context, uri, MAX_PDF_PAGES)
+        Log.d(PERF_TAG, "PDF render ${pages.size} pages: ${System.currentTimeMillis() - renderStartMs}ms")
+        if (pages.isEmpty()) return null
+
+        val thumb = createThumbnail(pages.first())
+        val item = try {
+            if (selectedPipeline == 0) {
+                val res = distilPipeline?.runPipeline(pages.first()) ?: return null
+                ClassifiedImage(
+                    id = nextId(),
+                    thumbnail = thumb,
+                    label = res.classification.label,
+                    confidence = res.classification.confidence,
+                    keywords = emptyList(),
+                    ocrText = res.ocr.text,
+                    pipeline = "PaddleOCR+DistilBERT",
+                    sourceName = fileName,
+                    pageCount = totalPages
+                )
+            } else {
+                val pipe = gemmaPipeline ?: return null
+                val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
+                val ocrStartMs = System.currentTimeMillis()
+                val ocrText = distilPipeline?.extractText(pages.first())?.text.orEmpty().trim()
+                Log.d(PERF_TAG, "Gemma OCR extract: ${System.currentTimeMillis() - ocrStartMs}ms, chars=${ocrText.length}")
+                val classifyStartMs = System.currentTimeMillis()
+                val res = if (ocrText.length >= 24) {
+                    pipe.classifyText(ocrText)
+                } else {
+                    pipe.classify(pages.first())
+                }
+                val mode = if (ocrText.length >= 24) "Text" else "Vision"
+                Log.d(PERF_TAG, "Gemma $mode classify: ${System.currentTimeMillis() - classifyStartMs}ms")
+                ClassifiedImage(
+                    id = nextId(),
+                    thumbnail = thumb,
+                    label = res.label,
+                    confidence = res.confidence,
+                    keywords = res.keywords,
+                    ocrText = if (ocrText.isNotBlank()) ocrText else res.evidence,
+                    pipeline = "Gemma 4 E2B $mode ($backendLabel)",
+                    sourceName = fileName,
+                    pageCount = totalPages
+                )
+            }
+        } finally {
+            pages.forEach { if (it != thumb) it.recycle() }
+        }
+        Log.d(PERF_TAG, "File total: ${System.currentTimeMillis() - fileStartMs}ms")
+        return item
+    }
+
+    val loadStartMs = System.currentTimeMillis()
+    val bitmap = loadBitmapFromUri(context, uri) ?: return null
+    Log.d(PERF_TAG, "Bitmap load: ${System.currentTimeMillis() - loadStartMs}ms, size=${bitmap.width}x${bitmap.height}")
+    val thumb = createThumbnail(bitmap)
+
+    return try {
+        val item = if (selectedPipeline == 0) {
+            val res = distilPipeline?.runPipeline(bitmap) ?: return null
+            ClassifiedImage(
+                id = nextId(),
+                thumbnail = thumb,
+                label = res.classification.label,
+                confidence = res.classification.confidence,
+                keywords = emptyList(),
+                ocrText = res.ocr.text,
+                pipeline = "PaddleOCR+DistilBERT",
+                sourceName = fileName
+            )
+        } else {
+            val pipe = gemmaPipeline ?: return null
+            val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
+            val ocrStartMs = System.currentTimeMillis()
+            val ocrText = distilPipeline?.extractText(bitmap)?.text.orEmpty().trim()
+            Log.d(PERF_TAG, "Gemma OCR extract: ${System.currentTimeMillis() - ocrStartMs}ms, chars=${ocrText.length}")
+            val classifyStartMs = System.currentTimeMillis()
+            val res = if (ocrText.length >= 24) {
+                pipe.classifyText(ocrText)
+            } else {
+                pipe.classify(bitmap)
+            }
+            val mode = if (ocrText.length >= 24) "Text" else "Vision"
+            Log.d(PERF_TAG, "Gemma $mode classify: ${System.currentTimeMillis() - classifyStartMs}ms")
+            ClassifiedImage(
+                id = nextId(),
+                thumbnail = thumb,
+                label = res.label,
+                confidence = res.confidence,
+                keywords = res.keywords,
+                ocrText = if (ocrText.isNotBlank()) ocrText else res.evidence,
+                pipeline = "Gemma 4 E2B $mode ($backendLabel)",
+                sourceName = fileName
+            )
+        }
+        Log.d(PERF_TAG, "File total: ${System.currentTimeMillis() - fileStartMs}ms")
+        item
+    } finally {
+        if (bitmap != thumb) bitmap.recycle()
     }
 }
 
@@ -617,17 +775,78 @@ fun UploadCard(onChooseFiles: () -> Unit, isProcessing: Boolean, processingProgr
     }
 }
 
+@Composable
+fun ProcessingOverlay(
+    progressText: String,
+    completed: Int,
+    total: Int,
+    onCancel: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.28f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CircularProgressIndicator(color = AppAccent, strokeWidth = 3.dp)
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    if (progressText.isBlank()) "Processing…" else progressText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AppTitleColor,
+                    textAlign = TextAlign.Center
+                )
+                if (total > 0) {
+                    Spacer(Modifier.height(12.dp))
+                    LinearProgressIndicator(
+                        progress = { completed.toFloat() / total.coerceAtLeast(1) },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = AppAccent,
+                        trackColor = AppBackground
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "$completed of $total completed",
+                        fontSize = 12.sp,
+                        color = EmptyStateText
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
+                OutlinedButton(onClick = onCancel) {
+                    Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Cancel")
+                }
+            }
+        }
+    }
+}
+
 // ─── Subject Card (clickable tile) ────────────────────────────────────────────
 
 @Composable
 fun SubjectCard(
     meta: SubjectMeta,
-    images: List<ClassifiedImage>,
+    count: Int,
+    firstImage: ClassifiedImage?,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     Card(
-        modifier = modifier.clickable(enabled = images.isNotEmpty()) { onClick() },
+        modifier = modifier.clickable(enabled = count > 0) { onClick() },
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -641,10 +860,10 @@ fun SubjectCard(
                 Spacer(Modifier.width(8.dp))
                 Column {
                     Text(meta.displayName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, lineHeight = 16.sp)
-                    Text("${images.size} items", color = Color.White.copy(alpha = 0.85f), fontSize = 11.sp)
+                    Text("$count items", color = Color.White.copy(alpha = 0.85f), fontSize = 11.sp)
                 }
             }
-            if (images.isEmpty()) {
+            if (firstImage == null) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -657,7 +876,7 @@ fun SubjectCard(
                 // Show compact summary — just first item thumbnail + count
                 Column(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
                     Image(
-                        bitmap = images.first().thumbnail.asImageBitmap(),
+                        bitmap = firstImage.thumbnail.asImageBitmap(),
                         contentDescription = null,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -667,18 +886,18 @@ fun SubjectCard(
                     )
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "${(images.first().confidence * 100).toInt()}% • ${images.first().pipeline}",
+                        "${(firstImage.confidence * 100).toInt()}% • ${firstImage.pipeline}",
                         fontSize = 9.sp, fontWeight = FontWeight.Medium, color = meta.headerColor,
                         maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
-                    if (images.size > 1) {
+                    if (count > 1) {
                         Text(
-                            "Tap to view all ${images.size} items",
+                            "Tap to view all $count items",
                             fontSize = 9.sp, color = AppAccent, fontWeight = FontWeight.Medium
                         )
                     } else {
                         Text(
-                            images.first().sourceName,
+                            firstImage.sourceName,
                             fontSize = 9.sp, color = EmptyStateText, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                     }
@@ -725,7 +944,7 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
                     modifier = Modifier.fillMaxSize().padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    items(images) { img ->
+                    items(images, key = { it.id }) { img ->
                         Card(
                             shape = RoundedCornerShape(10.dp),
                             colors = CardDefaults.cardColors(containerColor = meta.circleColor.copy(alpha = 0.15f)),
@@ -798,7 +1017,11 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SearchTab(searchEngine: SemanticSearchEngine?, engineError: String) {
+fun SearchTab(
+    searchEngine: SemanticSearchEngine?,
+    engineError: String,
+    classifiedImages: List<ClassifiedImage>
+) {
     val scope = rememberCoroutineScope()
 
     var query by remember { mutableStateOf("") }
@@ -807,9 +1030,16 @@ fun SearchTab(searchEngine: SemanticSearchEngine?, engineError: String) {
     var errorMsg by remember { mutableStateOf("") }
     var documentCount by remember { mutableIntStateOf(0) }
 
+    // Log recomposition
+    SideEffect {
+        Log.d(PERF_TAG, "SearchTab recomposed, results=${results.size}, images=${classifiedImages.size}")
+    }
+
     LaunchedEffect(searchEngine) {
-        if (searchEngine != null) {
-            withContext(Dispatchers.IO) { documentCount = searchEngine.documentCount() }
+        documentCount = if (searchEngine != null) {
+            withContext(Dispatchers.IO) { searchEngine.documentCount() }
+        } else {
+            0
         }
     }
 
@@ -886,9 +1116,12 @@ fun SearchTab(searchEngine: SemanticSearchEngine?, engineError: String) {
                         try {
                             val res = withContext(Dispatchers.IO) { searchEngine.search(query.trim(), topK = 8) }
                             results = res
-                            documentCount = searchEngine.documentCount()
+                            try { documentCount = searchEngine.documentCount() } catch (_: Exception) {}
                             if (res.isEmpty()) errorMsg = "No matching documents found."
-                        } catch (e: Exception) { errorMsg = "Search error: ${e.message}" }
+                        } catch (e: Exception) {
+                            Log.e("SearchTab", "Search crashed", e)
+                            errorMsg = "Search error: ${e.message?.take(100)}"
+                        }
                         isSearching = false
                     }
                 },
@@ -908,24 +1141,61 @@ fun SearchTab(searchEngine: SemanticSearchEngine?, engineError: String) {
             Text(errorMsg, fontSize = 13.sp, color = Color(0xFFE65100), modifier = Modifier.padding(vertical = 4.dp))
         }
 
+        // Detail view state
+        var selectedResult by remember { mutableStateOf<Pair<SearchResult, ClassifiedImage?>?>(null) }
+
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(results) { result -> SearchResultCard(result) }
-            item { Spacer(Modifier.height(24.dp)) }
+            items(results.size, key = { idx -> "search_result_$idx" }) { idx ->
+                val result = results[idx]
+                // Find matching thumbnail from classified images
+                val matchingImage = remember(classifiedImages, result) {
+                    classifiedImages.firstOrNull { it.sourceName == result.sourcePath }
+                }
+                SearchResultCard(
+                    result = result,
+                    thumbnail = matchingImage?.thumbnail,
+                    onClick = { selectedResult = result to matchingImage }
+                )
+            }
+            item(key = "search_bottom") { Spacer(Modifier.height(24.dp)) }
+        }
+
+        // Show detail dialog when a search result is tapped
+        selectedResult?.let { (result, image) ->
+            SearchResultDetailDialog(
+                result = result,
+                image = image,
+                onDismiss = { selectedResult = null }
+            )
         }
     }
 }
 
 @Composable
-fun SearchResultCard(result: SearchResult) {
+fun SearchResultCard(result: SearchResult, thumbnail: Bitmap? = null, onClick: () -> Unit = {}) {
     val meta = ALL_SUBJECT_META.firstOrNull { it.label == result.subject }
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().clickable { onClick() },
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
         Column(Modifier.padding(14.dp)) {
+            // Show thumbnail if available
+            if (thumbnail != null) {
+                Image(
+                    bitmap = thumbnail.asImageBitmap(),
+                    contentDescription = "Document image",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp)
+                        .clip(RoundedCornerShape(8.dp)),
+                    contentScale = ContentScale.Crop
+                )
+                Spacer(Modifier.height(10.dp))
+            }
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
@@ -959,6 +1229,228 @@ fun SearchResultCard(result: SearchResult) {
             Spacer(Modifier.height(6.dp))
             val fileName = result.sourcePath.substringAfterLast("/").take(40)
             Text("📄 $fileName", fontSize = 10.sp, color = EmptyStateText)
+        }
+    }
+}
+
+// ─── Search Result Detail Dialog (full view on click) ─────────────────────────
+
+@Composable
+fun SearchResultDetailDialog(
+    result: SearchResult,
+    image: ClassifiedImage?,
+    onDismiss: () -> Unit
+) {
+    val meta = ALL_SUBJECT_META.firstOrNull { it.label == result.subject }
+    val headerColor = meta?.headerColor ?: AppAccent
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.9f),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Column {
+                // Header bar
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(headerColor)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        meta?.icon ?: Icons.Default.Description,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            result.sourcePath.substringAfterLast("/"),
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            "${meta?.displayName ?: result.subject} • ${(result.score * 100).toInt()}% match",
+                            color = Color.White.copy(0.85f),
+                            fontSize = 12.sp
+                        )
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+                    }
+                }
+
+                // Content - scrollable
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // Full image view
+                    if (image != null) {
+                        item(key = "image") {
+                            Image(
+                                bitmap = image.thumbnail.asImageBitmap(),
+                                contentDescription = "Document: ${result.sourcePath}",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 200.dp, max = 400.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFFF5F5F5)),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+                    } else {
+                        // No image available - show placeholder
+                        item(key = "no_image") {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(120.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFFF0F0F0)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(
+                                        Icons.Default.Description,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(40.dp),
+                                        tint = Color(0xFFBBBBBB)
+                                    )
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        "Image not available in current session",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF999999)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Metadata section
+                    item(key = "meta") {
+                        Card(
+                            shape = RoundedCornerShape(10.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = (meta?.circleColor ?: AppBackground).copy(alpha = 0.15f)
+                            )
+                        ) {
+                            Column(Modifier.padding(14.dp)) {
+                                // Subject badge + score
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .background(headerColor, RoundedCornerShape(6.dp))
+                                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            meta?.displayName ?: result.subject,
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(
+                                        "${(result.score * 100).toInt()}% match",
+                                        fontSize = 13.sp,
+                                        color = headerColor,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    if (result.pageNum >= 0) {
+                                        Spacer(Modifier.weight(1f))
+                                        Text("Page ${result.pageNum + 1}", fontSize = 12.sp, color = EmptyStateText)
+                                    }
+                                }
+
+                                // Confidence from classification
+                                if (image != null) {
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        "Classification: ${(image.confidence * 100).toInt()}% confidence via ${image.pipeline}",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF666666)
+                                    )
+                                    if (image.pageCount > 1) {
+                                        Text(
+                                            "Document: ${image.pageCount} pages",
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF666666)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Keywords
+                    if (result.keywords.isNotEmpty()) {
+                        item(key = "keywords") {
+                            Column {
+                                Text("Keywords", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = AppTitleColor)
+                                Spacer(Modifier.height(8.dp))
+                                // Use FlowRow-like wrapping with multiple rows
+                                val chunkedKeywords = result.keywords.chunked(4)
+                                for (chunk in chunkedKeywords) {
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        modifier = Modifier.padding(bottom = 6.dp)
+                                    ) {
+                                        chunk.forEach { kw ->
+                                            Box(
+                                                modifier = Modifier
+                                                    .background(
+                                                        meta?.circleColor ?: AppBackground,
+                                                        RoundedCornerShape(6.dp)
+                                                    )
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                            ) {
+                                                Text(kw, fontSize = 11.sp, color = headerColor, fontWeight = FontWeight.Medium)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Full text content
+                    if (result.textChunk.isNotBlank()) {
+                        item(key = "text") {
+                            Column {
+                                Text("Content", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = AppTitleColor)
+                                Spacer(Modifier.height(8.dp))
+                                Card(
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFAFAFA)),
+                                    elevation = CardDefaults.cardElevation(0.dp)
+                                ) {
+                                    Text(
+                                        result.textChunk,
+                                        fontSize = 13.sp,
+                                        color = Color(0xFF333333),
+                                        lineHeight = 20.sp,
+                                        modifier = Modifier.padding(12.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    item(key = "detail_bottom") { Spacer(Modifier.height(8.dp)) }
+                }
+            }
         }
     }
 }

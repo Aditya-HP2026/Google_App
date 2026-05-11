@@ -41,6 +41,7 @@ class SemanticSearchEngine(
 
     private val encoder = MiniLMEncoder(context)
     private val db: SQLiteDatabase
+    private val lock = Any() // Thread-safety lock for encoder + db access
 
     companion object {
         private const val EMBEDDING_DIM = 384
@@ -94,7 +95,7 @@ class SemanticSearchEngine(
         keywords: List<String>,
         textChunk: String,
         pageNum: Int = 0
-    ): Long {
+    ): Long = synchronized(lock) {
         // Build text for embedding: combine subject, keywords, and text
         val embeddingText = buildString {
             append(subject)
@@ -120,7 +121,7 @@ class SemanticSearchEngine(
             put("created_at", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date()))
         }
 
-        return db.insert("documents", null, values)
+        db.insert("documents", null, values)
     }
 
     /**
@@ -131,7 +132,7 @@ class SemanticSearchEngine(
         query: String,
         topK: Int = 5,
         subjectFilter: String? = null
-    ): List<SearchResult> {
+    ): List<SearchResult> = synchronized(lock) {
         val queryEmbedding = encoder.encode(query)
 
         val sql = if (subjectFilter != null) {
@@ -186,7 +187,7 @@ class SemanticSearchEngine(
 
         candidates.sortByDescending { it.score }
 
-        return candidates.subList(0, min(topK, candidates.size)).map {
+        candidates.subList(0, min(topK, candidates.size)).map {
             SearchResult(
                 sourcePath = it.sourcePath,
                 pageNum    = it.pageNum,

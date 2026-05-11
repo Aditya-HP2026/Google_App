@@ -333,8 +333,19 @@ class GemmaImagePipeline(
     // ─── Utilities ────────────────────────────────────────────────────────────
 
     private fun bitmapToJpegBytes(bitmap: Bitmap): ByteArray {
+        // Downscale if too large to reduce inference time
+        val maxDim = maxOf(bitmap.width, bitmap.height)
+        val scaledBitmap = if (maxDim > 768) {
+            val scale = 768f / maxDim
+            val w = (bitmap.width * scale).toInt().coerceAtLeast(1)
+            val h = (bitmap.height * scale).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(bitmap, w, h, true)
+        } else {
+            bitmap
+        }
         val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 75, out)
+        if (scaledBitmap != bitmap) scaledBitmap.recycle()
         return out.toByteArray()
     }
 
