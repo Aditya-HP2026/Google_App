@@ -21,3 +21,5 @@ local.properties
 *.onnx
 documentai/src/main/assets/document_ai/paddleocr_distil_old_bundle/
 *.onnx
+documentai/src/main/assets/document_ai/paddleocr_distil_old_bundle/
+*.onnx
