@@ -19,3 +19,5 @@ local.properties
 /gemmaimage/build/
 /semanticsearch/build/documentai/src/main/assets/document_ai/paddleocr_distil_old_bundle/distilbert/model.onnx
 *.onnx
+documentai/src/main/assets/document_ai/paddleocr_distil_old_bundle/
+*.onnx
