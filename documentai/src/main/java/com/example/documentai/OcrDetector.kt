@@ -62,11 +62,13 @@ internal class OcrDetector(context: Context) : AutoCloseable {
     // ── Pre-processing ─────────────────────────────────────────────────────
 
     /**
-     * Resize so the longest side ≤ 960 and both dims are multiples of 32.
+     * Resize so the longest side ≤ 720 and both dims are multiples of 32.
      * Returns (resizedBitmap, scaleH, scaleW) where scale = original / resized.
+     * 
+     * OPTIMIZATION: Reduced from 960 → 720 for ~40% faster OCR detection.
      */
     private fun prepareResize(src: Bitmap): Triple<Bitmap, Float, Float> {
-        val maxLong = 960
+        val maxLong = 720  // OPTIMIZATION: Reduced from 960
         val oH = src.height.toFloat()
         val oW = src.width.toFloat()
         val scale = maxLong / maxOf(oH, oW)

@@ -634,17 +634,31 @@ private fun classifyUri(
             } else {
                 val pipe = gemmaPipeline ?: return null
                 val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
+                
+                // ── TIMING STAGE 1: OCR extraction ──
                 val ocrStartMs = System.currentTimeMillis()
                 val ocrText = distilPipeline?.extractText(pages.first())?.text.orEmpty().trim()
-                Log.d(PERF_TAG, "Gemma OCR extract: ${System.currentTimeMillis() - ocrStartMs}ms, chars=${ocrText.length}")
+                val ocrTimeMs = System.currentTimeMillis() - ocrStartMs
+                Log.d(PERF_TAG, "┌─── CLASSIFICATION PIPELINE (PDF, page 1) ───")
+                Log.d(PERF_TAG, "│ STAGE 1 (OCR):        $ocrTimeMs ms | chars=${ocrText.length}")
+                
+                // ── TIMING STAGE 2: Classification (Text vs Vision) ──
                 val classifyStartMs = System.currentTimeMillis()
-                val res = if (ocrText.length >= 24) {
+                val isTextMode = ocrText.length >= 12  // OPTIMIZATION: lowered from 24 → 12
+                val res = if (isTextMode) {
+                    Log.d(PERF_TAG, "│ STAGE 2 (Classify):   TEXT mode (OCR strong)")
                     pipe.classifyText(ocrText)
                 } else {
+                    Log.d(PERF_TAG, "│ STAGE 2 (Classify):   VISION mode (OCR weak/missing)")
                     pipe.classify(pages.first())
                 }
-                val mode = if (ocrText.length >= 24) "Text" else "Vision"
-                Log.d(PERF_TAG, "Gemma $mode classify: ${System.currentTimeMillis() - classifyStartMs}ms")
+                val classifyTimeMs = System.currentTimeMillis() - classifyStartMs
+                Log.d(PERF_TAG, "│                       $classifyTimeMs ms")
+                Log.d(PERF_TAG, "└─────────────────────────────────────────────")
+                
+                val totalMs = System.currentTimeMillis() - fileStartMs
+                Log.d(PERF_TAG, "📊 PDF FILE TOTAL: $totalMs ms | OCR: $ocrTimeMs ms | Classify: $classifyTimeMs ms")
+                
                 ClassifiedImage(
                     id = nextId(),
                     thumbnail = thumb,
@@ -652,7 +666,7 @@ private fun classifyUri(
                     confidence = res.confidence,
                     keywords = res.keywords,
                     ocrText = if (ocrText.isNotBlank()) ocrText else res.evidence,
-                    pipeline = "Gemma 4 E2B $mode ($backendLabel)",
+                    pipeline = "Gemma 4 E2B ${if (isTextMode) "Text" else "Vision"} ($backendLabel)",
                     sourceName = fileName,
                     pageCount = totalPages
                 )
@@ -685,17 +699,31 @@ private fun classifyUri(
         } else {
             val pipe = gemmaPipeline ?: return null
             val backendLabel = pipe.activeBackend?.displayName ?: "LiteRT"
+            
+            // ── TIMING STAGE 1: OCR extraction ──
             val ocrStartMs = System.currentTimeMillis()
             val ocrText = distilPipeline?.extractText(bitmap)?.text.orEmpty().trim()
-            Log.d(PERF_TAG, "Gemma OCR extract: ${System.currentTimeMillis() - ocrStartMs}ms, chars=${ocrText.length}")
+            val ocrTimeMs = System.currentTimeMillis() - ocrStartMs
+            Log.d(PERF_TAG, "┌─── CLASSIFICATION PIPELINE (IMAGE) ───────────")
+            Log.d(PERF_TAG, "│ STAGE 1 (OCR):        $ocrTimeMs ms | chars=${ocrText.length}")
+            
+            // ── TIMING STAGE 2: Classification (Text vs Vision) ──
             val classifyStartMs = System.currentTimeMillis()
-            val res = if (ocrText.length >= 24) {
+            val isTextMode = ocrText.length >= 12  // OPTIMIZATION: lowered from 24 → 12
+            val res = if (isTextMode) {
+                Log.d(PERF_TAG, "│ STAGE 2 (Classify):   TEXT mode (OCR strong)")
                 pipe.classifyText(ocrText)
             } else {
+                Log.d(PERF_TAG, "│ STAGE 2 (Classify):   VISION mode (OCR weak/missing)")
                 pipe.classify(bitmap)
             }
-            val mode = if (ocrText.length >= 24) "Text" else "Vision"
-            Log.d(PERF_TAG, "Gemma $mode classify: ${System.currentTimeMillis() - classifyStartMs}ms")
+            val classifyTimeMs = System.currentTimeMillis() - classifyStartMs
+            Log.d(PERF_TAG, "│                       $classifyTimeMs ms")
+            Log.d(PERF_TAG, "└─────────────────────────────────────────────")
+            
+            val totalMs = System.currentTimeMillis() - fileStartMs
+            Log.d(PERF_TAG, "📊 IMAGE FILE TOTAL: $totalMs ms | OCR: $ocrTimeMs ms | Classify: $classifyTimeMs ms")
+            
             ClassifiedImage(
                 id = nextId(),
                 thumbnail = thumb,
@@ -703,7 +731,7 @@ private fun classifyUri(
                 confidence = res.confidence,
                 keywords = res.keywords,
                 ocrText = if (ocrText.isNotBlank()) ocrText else res.evidence,
-                pipeline = "Gemma 4 E2B $mode ($backendLabel)",
+                pipeline = "Gemma 4 E2B ${if (isTextMode) "Text" else "Vision"} ($backendLabel)",
                 sourceName = fileName
             )
         }

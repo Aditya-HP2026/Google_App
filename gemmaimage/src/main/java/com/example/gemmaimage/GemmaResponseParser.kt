@@ -1,13 +1,19 @@
 package com.example.gemmaimage
 
+import android.util.Log
 import com.example.gemmaimage.model.GemmaImageResult
 import org.json.JSONObject
 import kotlin.math.max
 import kotlin.math.min
 
 object GemmaResponseParser {
+    private const val TAG = "GemmaResponseParser"
+    
     fun parse(rawResponse: String, elapsedMs: Long = 0L): GemmaImageResult {
-        val json = JSONObject(extractJson(rawResponse))
+        val extractedJson = extractJson(rawResponse)
+        Log.d(TAG, "Extracted JSON: $extractedJson")
+        
+        val json = JSONObject(extractedJson)
         val label = normalizeLabel(json.optString("subject", "unknown"))
         val confidence = min(1f, max(0f, json.optDouble("confidence", 0.0).toFloat()))
         val keywordArray = json.optJSONArray("keywords")
@@ -20,6 +26,9 @@ object GemmaResponseParser {
                 .distinct()
         }
         val evidence = json.optString("evidence", "")
+        
+        Log.d(TAG, "Parsed: subject='$label', confidence=$confidence, keywords=${keywords.size}")
+        
         return GemmaImageResult(
             label = label,
             confidence = confidence,
@@ -35,13 +44,20 @@ object GemmaResponseParser {
         // Note: backticks are escaped for Android's regex engine
         val fencedPattern = Regex("\\`\\`\\`(?:json)?\\s*(\\{.*?\\})\\s*\\`\\`\\`", RegexOption.DOT_MATCHES_ALL)
         val fenced = fencedPattern.find(raw)?.groupValues?.getOrNull(1)
-        if (fenced != null) return fenced
+        if (fenced != null) {
+            Log.d(TAG, "Found JSON in code fence")
+            return fenced
+        }
 
         // Fallback: find the first { and last }
         val start = raw.indexOf('{')
         val end = raw.lastIndexOf('}')
-        if (start >= 0 && end > start) return raw.substring(start, end + 1)
+        if (start >= 0 && end > start) {
+            Log.d(TAG, "Extracted JSON from raw text (start=$start, end=$end)")
+            return raw.substring(start, end + 1)
+        }
 
+        Log.e(TAG, "Failed to extract JSON from response: ${raw.take(200)}")
         throw IllegalArgumentException("Gemma response did not contain a JSON object.")
     }
 
