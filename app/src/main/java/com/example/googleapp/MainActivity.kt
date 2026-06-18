@@ -34,6 +34,10 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -43,6 +47,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.example.documentai.DocumentAiPipeline
 import com.example.gemmaimage.GemmaImagePipeline
 import com.example.gemmaimage.GemmaInitException
@@ -278,7 +283,8 @@ fun MainScreen() {
                 1 -> SearchTab(
                     searchEngine = searchEngine,
                     engineError = searchEngineError,
-                    classifiedImages = classifiedImages
+                    classifiedImages = classifiedImages,
+                    onClearImages = { classifiedImages = emptyList() }
                 )
             }
         }
@@ -567,7 +573,15 @@ fun ClassifyTab(
         SubjectDetailDialog(
             meta = meta,
             images = subjectImages,
-            onDismiss = { selectedSubject = null }
+            onDismiss = { selectedSubject = null },
+            onDeleteImage = { img ->
+                onImagesUpdated(classifiedImages.filter { it.id != img.id })
+                if (searchEngine != null) {
+                    scope.launch(Dispatchers.IO) {
+                        runCatching { searchEngine.removeDocument(img.sourceName) }
+                    }
+                }
+            }
         )
     }
 }
@@ -938,7 +952,17 @@ fun SubjectCard(
 // ─── Subject Detail Dialog (full list of classified items) ────────────────────
 
 @Composable
-fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDismiss: () -> Unit) {
+fun SubjectDetailDialog(
+    meta: SubjectMeta,
+    images: List<ClassifiedImage>,
+    onDismiss: () -> Unit,
+    onDeleteImage: (ClassifiedImage) -> Unit = {}
+) {
+    // Auto-dismiss when all items have been deleted
+    LaunchedEffect(images.isEmpty()) {
+        if (images.isEmpty()) onDismiss()
+    }
+
     Dialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
@@ -973,6 +997,8 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     items(images, key = { it.id }) { img ->
+                        var showDeleteConfirm by remember { mutableStateOf(false) }
+
                         Card(
                             shape = RoundedCornerShape(10.dp),
                             colors = CardDefaults.cardColors(containerColor = meta.circleColor.copy(alpha = 0.15f)),
@@ -990,13 +1016,36 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
                                 )
                                 Spacer(Modifier.height(8.dp))
 
-                                // File info
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                // File info row with delete button
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
                                     Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(14.dp), tint = meta.headerColor)
                                     Spacer(Modifier.width(4.dp))
-                                    Text(img.sourceName, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = AppTitleColor, maxLines = 1)
+                                    Text(
+                                        img.sourceName,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = AppTitleColor,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
                                     if (img.pageCount > 1) {
-                                        Text(" (${img.pageCount} pages)", fontSize = 11.sp, color = EmptyStateText)
+                                        Text(" (${img.pageCount}p)", fontSize = 11.sp, color = EmptyStateText)
+                                    }
+                                    // Delete button
+                                    IconButton(
+                                        onClick = { showDeleteConfirm = true },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Delete,
+                                            contentDescription = "Delete",
+                                            tint = Color(0xFFE53935),
+                                            modifier = Modifier.size(18.dp)
+                                        )
                                     }
                                 }
 
@@ -1034,7 +1083,31 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
                                 }
                             }
                         }
+
+                        // Confirm delete dialog
+                        if (showDeleteConfirm) {
+                            AlertDialog(
+                                onDismissRequest = { showDeleteConfirm = false },
+                                title = { Text("Delete Image?") },
+                                text = { Text("\"${img.sourceName}\" will be removed from the library and the search index.") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        showDeleteConfirm = false
+                                        onDeleteImage(img)
+                                    }) {
+                                        Text("Delete", color = Color(0xFFE53935))
+                                    }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDeleteConfirm = false }) {
+                                        Text("Cancel")
+                                    }
+                                }
+                            )
+                        }
                     }
+
+                    item(key = "detail_bottom") { Spacer(Modifier.height(8.dp)) }
                 }
             }
         }
@@ -1048,7 +1121,8 @@ fun SubjectDetailDialog(meta: SubjectMeta, images: List<ClassifiedImage>, onDism
 fun SearchTab(
     searchEngine: SemanticSearchEngine?,
     engineError: String,
-    classifiedImages: List<ClassifiedImage>
+    classifiedImages: List<ClassifiedImage>,
+    onClearImages: () -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
 
@@ -1057,6 +1131,7 @@ fun SearchTab(
     var isSearching by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf("") }
     var documentCount by remember { mutableIntStateOf(0) }
+    var showClearConfirm by remember { mutableStateOf(false) }
 
     // Log recomposition
     SideEffect {
@@ -1083,6 +1158,18 @@ fun SearchTab(
             Text("🔍", fontSize = 22.sp)
             Spacer(Modifier.width(6.dp))
             Text("Semantic Search", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = AppTitleColor)
+            Spacer(Modifier.weight(1f))
+            // Clear database button — only shown when there are indexed documents
+            if (searchEngine != null && documentCount > 0) {
+                IconButton(onClick = { showClearConfirm = true }) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Clear database",
+                        tint = Color(0xFFE53935),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
         }
         Spacer(Modifier.height(6.dp))
         Text(
@@ -1169,31 +1256,60 @@ fun SearchTab(
             Text(errorMsg, fontSize = 13.sp, color = Color(0xFFE65100), modifier = Modifier.padding(vertical = 4.dp))
         }
 
-        // Detail view state
-        var selectedResult by remember { mutableStateOf<Pair<SearchResult, ClassifiedImage?>?>(null) }
+        // Image viewer state
+        var selectedImage by remember { mutableStateOf<Bitmap?>(null) }
 
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(results.size, key = { idx -> "search_result_$idx" }) { idx ->
                 val result = results[idx]
-                // Find matching thumbnail from classified images
+                // Find matching thumbnail from classified images (in current session only)
                 val matchingImage = remember(classifiedImages, result) {
                     classifiedImages.firstOrNull { it.sourceName == result.sourcePath }
                 }
                 SearchResultCard(
                     result = result,
                     thumbnail = matchingImage?.thumbnail,
-                    onClick = { selectedResult = result to matchingImage }
+                    onClick = { if (matchingImage?.thumbnail != null) selectedImage = matchingImage.thumbnail }
                 )
             }
             item(key = "search_bottom") { Spacer(Modifier.height(24.dp)) }
         }
 
-        // Show detail dialog when a search result is tapped
-        selectedResult?.let { (result, image) ->
-            SearchResultDetailDialog(
-                result = result,
-                image = image,
-                onDismiss = { selectedResult = null }
+        // Show full-screen image viewer when a result is tapped
+        selectedImage?.let { bmp ->
+            ImageViewerDialog(
+                image = bmp,
+                onDismiss = { selectedImage = null }
+            )
+        }
+
+        // Confirm clear database dialog
+        if (showClearConfirm) {
+            AlertDialog(
+                onDismissRequest = { showClearConfirm = false },
+                title = { Text("Clear Database?") },
+                text = { Text("All $documentCount indexed documents will be permanently deleted from the search index. This cannot be undone.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showClearConfirm = false
+                        scope.launch(Dispatchers.IO) {
+                            runCatching { searchEngine?.clearAllDocuments() }
+                            withContext(Dispatchers.Main) {
+                                results = emptyList()
+                                documentCount = 0
+                                errorMsg = ""
+                                onClearImages()
+                            }
+                        }
+                    }) {
+                        Text("Clear All", color = Color(0xFFE53935), fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearConfirm = false }) {
+                        Text("Cancel")
+                    }
+                }
             )
         }
     }
@@ -1204,280 +1320,147 @@ fun SearchResultCard(result: SearchResult, thumbnail: Bitmap? = null, onClick: (
     val meta = ALL_SUBJECT_META.firstOrNull { it.label == result.subject }
 
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { onClick() },
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (thumbnail != null) Modifier.clickable { onClick() } else Modifier),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
-        Column(Modifier.padding(14.dp)) {
-            // Show thumbnail if available
-            if (thumbnail != null) {
-                Image(
-                    bitmap = thumbnail.asImageBitmap(),
-                    contentDescription = "Document image",
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(120.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                    contentScale = ContentScale.Crop
-                )
-                Spacer(Modifier.height(10.dp))
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        if (thumbnail != null) {
+            // Show image only (tap to open full-screen viewer)
+            Image(
+                bitmap = thumbnail.asImageBitmap(),
+                contentDescription = "Search result image",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 120.dp, max = 240.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                contentScale = ContentScale.Fit
+            )
+        } else {
+            // No in-session thumbnail — show minimal file info from DB record
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Box(
                     modifier = Modifier
-                        .background(meta?.headerColor ?: AppAccent, RoundedCornerShape(6.dp))
-                        .padding(horizontal = 8.dp, vertical = 3.dp)
-                ) {
-                    Text(meta?.displayName ?: result.subject, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
-                Spacer(Modifier.width(8.dp))
-                Text("${(result.score * 100).toInt()}% match", fontSize = 11.sp, color = AppAccent, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.weight(1f))
-                if (result.pageNum >= 0) Text("p.${result.pageNum + 1}", fontSize = 10.sp, color = EmptyStateText)
-            }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                result.textChunk.take(240) + if (result.textChunk.length > 240) "…" else "",
-                fontSize = 13.sp, color = Color(0xFF333333), lineHeight = 18.sp
-            )
-            if (result.keywords.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    result.keywords.take(5).forEach { kw ->
-                        Box(
-                            modifier = Modifier
-                                .background(meta?.circleColor ?: AppBackground, RoundedCornerShape(4.dp))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) { Text(kw, fontSize = 10.sp, color = meta?.headerColor ?: AppAccent) }
-                    }
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            val fileName = result.sourcePath.substringAfterLast("/").take(40)
-            Text("📄 $fileName", fontSize = 10.sp, color = EmptyStateText)
-        }
-    }
-}
-
-// ─── Search Result Detail Dialog (full view on click) ─────────────────────────
-
-@Composable
-fun SearchResultDetailDialog(
-    result: SearchResult,
-    image: ClassifiedImage?,
-    onDismiss: () -> Unit
-) {
-    val meta = ALL_SUBJECT_META.firstOrNull { it.label == result.subject }
-    val headerColor = meta?.headerColor ?: AppAccent
-
-    Dialog(onDismissRequest = onDismiss) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.9f),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-        ) {
-            Column {
-                // Header bar
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(headerColor)
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .size(44.dp)
+                        .background(
+                            meta?.circleColor ?: AppBackground,
+                            RoundedCornerShape(10.dp)
+                        ),
+                    contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         meta?.icon ?: Icons.Default.Description,
                         contentDescription = null,
-                        tint = Color.White,
+                        tint = meta?.headerColor ?: AppAccent,
                         modifier = Modifier.size(24.dp)
                     )
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            result.sourcePath.substringAfterLast("/"),
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            "${meta?.displayName ?: result.subject} • ${(result.score * 100).toInt()}% match",
-                            color = Color.White.copy(0.85f),
-                            fontSize = 12.sp
-                        )
-                    }
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
-                    }
                 }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        result.sourcePath.substringAfterLast("/"),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = AppTitleColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        meta?.displayName ?: result.subject,
+                        fontSize = 11.sp,
+                        color = meta?.headerColor ?: AppAccent,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                Icon(
+                    Icons.Default.ImageNotSupported,
+                    contentDescription = "No preview",
+                    tint = Color(0xFFCCCCCC),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
 
-                // Content - scrollable
-                LazyColumn(
+// ─── Full-screen Image Viewer Dialog (zoomable + pannable + closeable) ────────
+
+@Composable
+fun ImageViewerDialog(image: Bitmap, onDismiss: () -> Unit) {
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        scale = (scale * zoomChange).coerceIn(0.5f, 6f)
+        offset += panChange * scale
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = false
+        )
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            // Zoomable & pannable image
+            Image(
+                bitmap = image.asImageBitmap(),
+                contentDescription = "Full size image",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offset.x,
+                        translationY = offset.y
+                    )
+                    .transformable(state = transformState),
+                contentScale = ContentScale.Fit
+            )
+
+            // Close button (top-right)
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+                    .size(40.dp)
+                    .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+            ) {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = "Close",
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+
+            // Hint text (fades away after first zoom)
+            if (scale == 1f) {
+                Text(
+                    "Pinch to zoom • Drag to pan",
+                    fontSize = 11.sp,
+                    color = Color.White.copy(alpha = 0.6f),
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    // Full image view
-                    if (image != null) {
-                        item(key = "image") {
-                            Image(
-                                bitmap = image.thumbnail.asImageBitmap(),
-                                contentDescription = "Document: ${result.sourcePath}",
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(min = 200.dp, max = 400.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(Color(0xFFF5F5F5)),
-                                contentScale = ContentScale.Fit
-                            )
-                        }
-                    } else {
-                        // No image available - show placeholder
-                        item(key = "no_image") {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(120.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(Color(0xFFF0F0F0)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Icon(
-                                        Icons.Default.Description,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(40.dp),
-                                        tint = Color(0xFFBBBBBB)
-                                    )
-                                    Spacer(Modifier.height(8.dp))
-                                    Text(
-                                        "Image not available in current session",
-                                        fontSize = 12.sp,
-                                        color = Color(0xFF999999)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // Metadata section
-                    item(key = "meta") {
-                        Card(
-                            shape = RoundedCornerShape(10.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = (meta?.circleColor ?: AppBackground).copy(alpha = 0.15f)
-                            )
-                        ) {
-                            Column(Modifier.padding(14.dp)) {
-                                // Subject badge + score
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(
-                                        modifier = Modifier
-                                            .background(headerColor, RoundedCornerShape(6.dp))
-                                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                                    ) {
-                                        Text(
-                                            meta?.displayName ?: result.subject,
-                                            color = Color.White,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                    Spacer(Modifier.width(10.dp))
-                                    Text(
-                                        "${(result.score * 100).toInt()}% match",
-                                        fontSize = 13.sp,
-                                        color = headerColor,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    if (result.pageNum >= 0) {
-                                        Spacer(Modifier.weight(1f))
-                                        Text("Page ${result.pageNum + 1}", fontSize = 12.sp, color = EmptyStateText)
-                                    }
-                                }
-
-                                // Confidence from classification
-                                if (image != null) {
-                                    Spacer(Modifier.height(8.dp))
-                                    Text(
-                                        "Classification: ${(image.confidence * 100).toInt()}% confidence via ${image.pipeline}",
-                                        fontSize = 12.sp,
-                                        color = Color(0xFF666666)
-                                    )
-                                    if (image.pageCount > 1) {
-                                        Text(
-                                            "Document: ${image.pageCount} pages",
-                                            fontSize = 12.sp,
-                                            color = Color(0xFF666666)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Keywords
-                    if (result.keywords.isNotEmpty()) {
-                        item(key = "keywords") {
-                            Column {
-                                Text("Keywords", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = AppTitleColor)
-                                Spacer(Modifier.height(8.dp))
-                                // Use FlowRow-like wrapping with multiple rows
-                                val chunkedKeywords = result.keywords.chunked(4)
-                                for (chunk in chunkedKeywords) {
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                        modifier = Modifier.padding(bottom = 6.dp)
-                                    ) {
-                                        chunk.forEach { kw ->
-                                            Box(
-                                                modifier = Modifier
-                                                    .background(
-                                                        meta?.circleColor ?: AppBackground,
-                                                        RoundedCornerShape(6.dp)
-                                                    )
-                                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                                            ) {
-                                                Text(kw, fontSize = 11.sp, color = headerColor, fontWeight = FontWeight.Medium)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Full text content
-                    if (result.textChunk.isNotBlank()) {
-                        item(key = "text") {
-                            Column {
-                                Text("Content", fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = AppTitleColor)
-                                Spacer(Modifier.height(8.dp))
-                                Card(
-                                    shape = RoundedCornerShape(8.dp),
-                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFAFAFA)),
-                                    elevation = CardDefaults.cardElevation(0.dp)
-                                ) {
-                                    Text(
-                                        result.textChunk,
-                                        fontSize = 13.sp,
-                                        color = Color(0xFF333333),
-                                        lineHeight = 20.sp,
-                                        modifier = Modifier.padding(12.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    item(key = "detail_bottom") { Spacer(Modifier.height(8.dp)) }
-                }
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 20.dp)
+                        .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(20.dp))
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                )
             }
         }
     }

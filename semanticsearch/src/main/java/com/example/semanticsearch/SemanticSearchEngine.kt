@@ -70,13 +70,12 @@ class SemanticSearchEngine(
         db = if (dbFile.exists()) {
             SQLiteDatabase.openDatabase(dbFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
         } else {
-            // Create new database
             dbFile.parentFile?.mkdirs()
-            SQLiteDatabase.openOrCreateDatabase(dbFile, null).also { database ->
-                database.execSQL(CREATE_TABLE_SQL)
-                database.execSQL(CREATE_INDEX_SQL)
-            }
+            SQLiteDatabase.openOrCreateDatabase(dbFile, null)
         }
+        // Always ensure schema is up to date (safe with IF NOT EXISTS)
+        db.execSQL(CREATE_TABLE_SQL)
+        db.execSQL(CREATE_INDEX_SQL)
     }
 
     /**
@@ -96,6 +95,14 @@ class SemanticSearchEngine(
         textChunk: String,
         pageNum: Int = 0
     ): Long = synchronized(lock) {
+        // Skip if this source path is already indexed (prevent duplicate entries)
+        val existsCursor = db.rawQuery(
+            "SELECT id FROM documents WHERE source_path = ? LIMIT 1",
+            arrayOf(sourcePath)
+        )
+        val alreadyIndexed = existsCursor.use { it.moveToFirst() }
+        if (alreadyIndexed) return@synchronized -1L
+
         // Build text for embedding: combine subject, keywords, and text
         val embeddingText = buildString {
             append(subject)
@@ -187,7 +194,11 @@ class SemanticSearchEngine(
 
         candidates.sortByDescending { it.score }
 
-        candidates.subList(0, min(topK, candidates.size)).map {
+        // Deduplicate: keep only the highest-scoring entry per source_path
+        val seen = mutableSetOf<String>()
+        val deduplicated = candidates.filter { seen.add(it.sourcePath) }
+
+        deduplicated.subList(0, min(topK, deduplicated.size)).map {
             SearchResult(
                 sourcePath = it.sourcePath,
                 pageNum    = it.pageNum,
@@ -209,6 +220,22 @@ class SemanticSearchEngine(
     fun documentCount(): Int {
         val c = db.rawQuery("SELECT COUNT(*) FROM documents", null)
         return c.use { if (it.moveToFirst()) it.getInt(0) else 0 }
+    }
+
+    /**
+     * Removes all indexed entries for [sourcePath].
+     * @return Number of rows deleted.
+     */
+    fun removeDocument(sourcePath: String): Int = synchronized(lock) {
+        db.delete("documents", "source_path = ?", arrayOf(sourcePath))
+    }
+
+    /**
+     * Removes ALL documents from the index.
+     * @return Number of rows deleted.
+     */
+    fun clearAllDocuments(): Int = synchronized(lock) {
+        db.delete("documents", null, null)
     }
 
     private fun floatArrayToBlob(arr: FloatArray): ByteArray {
